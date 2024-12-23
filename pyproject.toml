@@ -1,0 +1,10 @@
+[tool.black]
+line-length = 88
+target-version = ['py37']
+include = '\.pyi?$'
+
+[tool.pylint.messages_control]
+disable = "all"
+
+[tool.flake8]
+ignore = "all"

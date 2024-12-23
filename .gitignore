@@ -64,3 +64,4 @@ yarn-error.log*
 # TensorFlow
 .tf_keras_temp/
 .keras/
+data/cache/
