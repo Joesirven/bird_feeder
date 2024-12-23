@@ -1,0 +1,66 @@
+# Python virtual environment
+venv/
+venv310/
+env/
+.env/
+.venv/
+ENV/
+venv310/*
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Logs
+*.log
+logs/
+log/
+
+# Local development
+*.sqlite3
+.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# mypy
+.mypy_cache/
+
+# Coverage reports
+coverage/
+
+# Node (in case you have any JavaScript/Node.js components)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TensorFlow
+.tf_keras_temp/
+.keras/
