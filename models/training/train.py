@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from models.training.process import main as process_data
 from models.training.config import Config
+from .validation import DataValidator
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +34,12 @@ except Exception as e:
 
 class ModelTrainer:
     def __init__(self):
+        # validate dataset
+        validator = DataValidator()
+        if not validator.validate_all():
+            raise ValueError("Dataset validation failed. Exiting.")
+
+        self.model = None
         self.model = None
         self.train_ds = None
         self.val_ds = None
