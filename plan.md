@@ -43,6 +43,7 @@
    - Preprocessing: ✅ Complete
    - Model training: ⏳ In Progress
    - Model optimization: 🔜 Pending
+   - Dataset shuffling optimization: 📝 TODO
 
 2. System Architecture
    - Dataset Protocol implementation: ✅ Complete
@@ -56,6 +57,7 @@
    - Test: 2,625 images (83 batches)
    - Image dimensions: 96x96x3 (RGB)
    - Memory footprint per batch: ~884KB
+   - Current state: Sequential ordering (to be optimized)
 
 2. Performance Benchmarks
    - Processing speed: ~1,700 images/second
@@ -455,3 +457,10 @@ board_build.f_cpu = 240000000L
    - Web interface development
    - Data collection system
    - Long-term testing
+
+### TODOs for Optimization 📝
+1. **Dataset Shuffling**
+   - Implement tf.data.Dataset shuffling
+   - Add buffer size optimization
+   - Verify random distribution
+   - Benchmark impact on training

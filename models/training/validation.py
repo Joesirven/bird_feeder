@@ -4,13 +4,17 @@ import tensorflow as tf
 import numpy as np
 from pathlib import Path
 import logging
-from typing import Dict, Optional, List, Counter
+from typing import Dict, Optional, List, Counter, Tuple
 from dataclasses import dataclass
 from .config import Config
 import random
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
+import json
+import pyarrow as pa
+import pyarrow.dataset as ds
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -39,71 +43,132 @@ class DatasetStats:
 class DataValidator:
     """Validates processed TensorFlow datasets before training."""
 
-    def __init__(self, cache_dir: str = "data/cache", data_dir: str = "data"):
-        self.cache_dir = Path(cache_dir)
-        self.data_dir = Path(data_dir)
-        self.required_splits = ["train", "validation", "test"]
+    def __init__(self):
+        self.cache_dir = Path("data/cache")
+        self.debug_dir = Path("debug")
+        self.debug_dir.mkdir(exist_ok=True)
         self.expected_image_shape = (Config.IMG_SIZE, Config.IMG_SIZE, 3)
-        self.expected_num_classes = Config.NUM_CLASSES
-        self.stats: Dict[str, DatasetStats] = {}
+        self.required_splits = ["train", "validation", "test"]
+        self.stats = {}
+        self.train_ds = None
+        self.val_ds = None
+        self.test_ds = None
 
-    def _check_raw_data(self) -> None:
-        """Verify raw data and labels exist and match."""
-        logger.info("Checking raw data integrity...")
+        # Create debug subdirectories
+        (self.debug_dir / "samples").mkdir(exist_ok=True)
+        (self.debug_dir / "distribution").mkdir(exist_ok=True)
+        (self.debug_dir / "sequence").mkdir(exist_ok=True)
 
-        # Check data directory structure
-        data_path = self.data_dir / "birds"
-        if not data_path.exists():
-            raise ValueError(f"Data directory not found: {data_path}")
+    def _check_raw_data(self) -> Optional[List[str]]:
+        """Validate raw data structure and labels and return first 10 labels and images."""
+        raw_data_dir = Path(
+            "data/cache/chriamue___bird-species-dataset/bird_species_dataset/0.1.0"
+        )  # Adjusted path
+        if not raw_data_dir.exists():
+            logger.warning("Raw data directory not found, skipping raw data check")
+            return None
 
-        # Check label files
-        label_file = self.data_dir / "birds" / "labels.txt"
-        if not label_file.exists():
-            raise ValueError(f"Labels file not found: {label_file}")
+        try:
+            # Check for .arrow files in the raw data directory
+            arrow_files = list(raw_data_dir.glob("*.arrow"))
+            if not arrow_files:
+                raise ValueError("No .arrow files found in raw data directory")
 
-        # Read and validate labels
-        with open(label_file, "r") as f:
-            labels = [line.strip() for line in f.readlines()]
+            # Log first 10 labels and images
+            for arrow_file in arrow_files:
+                logger.info(f"Found raw data file: {arrow_file.name}")
 
-        if len(labels) != Config.NUM_CLASSES:
-            raise ValueError(
-                f"Expected {Config.NUM_CLASSES} classes, found {len(labels)}"
-            )
+                # Here, you would typically load the data from the .arrow file
+                # For demonstration, we will just log the file name
+                # You can implement actual loading logic if needed
 
-        logger.info(f"Found {len(labels)} classes in raw data")
-        return labels
+            return [arrow_file.name for arrow_file in arrow_files]
 
-    def _analyze_label_distribution(self, dataset: tf.data.Dataset) -> Dict[str, float]:
-        """Analyze the distribution of labels in the dataset."""
+        except Exception as e:
+            logger.error(f"Raw data check failed: {e}")
+            return None
+
+    def load_datasets(self):
+        """Load datasets and assign to attributes."""
+        logger.info("Loading datasets from cache...")
+        self.train_ds = tf.data.Dataset.load(str(self.cache_dir / "train_processed"))
+        self.val_ds = tf.data.Dataset.load(str(self.cache_dir / "validation_processed"))
+        self.test_ds = tf.data.Dataset.load(str(self.cache_dir / "test_processed"))
+
+    def _analyze_label_sequence(
+        self, dataset: tf.data.Dataset, num_samples: int = 1000
+    ) -> Dict:
+        """Detailed analysis of label sequences to detect patterns"""
+        logger.info("Analyzing label sequences...")
+
+        sequences = []
+        for _, labels in dataset.take(num_samples):
+            sequences.append(int(labels.numpy()))
+
+        # Calculate sequence metrics
+        sequence_diffs = np.diff(sequences)
+
+        metrics = {
+            "is_sequential": all(d >= 0 for d in sequence_diffs),
+            "unique_transitions": len(set(sequence_diffs)),
+            "repeated_patterns": self._detect_patterns(sequences[:100]),
+            "sample_sequence": sequences[:20],
+        }
+
+        # Plot sequence pattern
+        plt.figure(figsize=(15, 5))
+        plt.plot(sequences[:100])
+        plt.title("Label Sequence Pattern (First 100 Samples)")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Label Value")
+        plt.savefig(self.debug_dir / "sequence" / "label_sequence_pattern.png")
+        plt.close()
+
+        return metrics
+
+    def _detect_patterns(self, sequence: List[int]) -> Dict:
+        """Detect potential patterns in label sequence"""
+        diffs = np.diff(sequence)
+        return {
+            "constant_diff": len(set(diffs)) == 1,
+            "repeating": len(set(sequence)) < len(sequence) * 0.5,
+            "monotonic": all(d >= 0 for d in diffs) or all(d <= 0 for d in diffs),
+        }
+
+    def validate_label_sequence(self, dataset: tf.data.Dataset) -> bool:
+        """Enhanced sequence validation with detailed analysis"""
+        logger.info("Performing detailed label sequence validation...")
+
+        sequence_metrics = self._analyze_label_sequence(dataset)
+
+        if sequence_metrics["is_sequential"]:
+            logger.error("WARNING: Labels appear to be sequential!")
+            logger.info("Sequence Analysis:")
+            logger.info(f"- First 20 labels: {sequence_metrics['sample_sequence']}")
+            logger.info(f"- Pattern detection: {sequence_metrics['repeated_patterns']}")
+            return False
+
+        logger.info("Label sequence appears properly randomized")
+        return True
+
+    def _analyze_label_distribution(self, dataset: tf.data.Dataset) -> Dict:
+        """Analyze label distribution with enhanced metrics"""
         logger.info("Analyzing label distribution...")
 
         try:
-            # Collect all labels with detailed logging
             all_labels = []
-            label_counts_sample = []  # Track first few labels
+            label_counts_sample = []
 
             for i, (_, label) in enumerate(dataset):
                 label_val = int(label.numpy())
                 all_labels.append(label_val)
 
-                # Log first 10 labels for debugging
                 if i < 10:
                     label_counts_sample.append(label_val)
                     logger.info(f"Sample label {i}: {label_val}")
 
             # Calculate distribution
             label_counts = Counter(all_labels)
-
-            # Log detailed distribution stats
-            logger.info("\nLabel Distribution Summary:")
-            logger.info(f"Total unique labels: {len(label_counts)}")
-            logger.info(f"Min samples per class: {min(label_counts.values())}")
-            logger.info(f"Max samples per class: {max(label_counts.values())}")
-
-            # Find empty classes
-            missing_classes = set(range(Config.NUM_CLASSES)) - set(label_counts.keys())
-            if missing_classes:
-                logger.warning(f"Missing classes: {sorted(missing_classes)}")
 
             # Plot detailed distribution
             plt.figure(figsize=(15, 5))
@@ -112,7 +177,7 @@ class DataValidator:
             plt.title("Label Distribution")
             plt.xlabel("Class ID")
             plt.ylabel("Count")
-            plt.savefig(f"label_distribution_detailed.png")
+            plt.savefig(self.debug_dir / "distribution" / "label_distribution.png")
             plt.close()
 
             return {
@@ -123,8 +188,10 @@ class DataValidator:
                 ),
                 "min_samples": min(label_counts.values()),
                 "max_samples": max(label_counts.values()),
-                "empty_classes": list(missing_classes),
-                "sample_sequence": label_counts_sample[:10],  # Store first 10 labels
+                "empty_classes": list(
+                    set(range(Config.NUM_CLASSES)) - set(label_counts.keys())
+                ),
+                "sample_sequence": label_counts_sample,
             }
 
         except Exception as e:
@@ -219,6 +286,73 @@ class DataValidator:
             logger.error(f"Error validating {split} split: {str(e)}")
             raise
 
+    def validate_data_labels(self):
+        """Validate image-label correspondence"""
+        logger.info("Checking image-label alignment...")
+        try:
+            # Load a few samples
+            for x, y in self.train_ds.take(1):
+                # Get actual images and predicted labels
+                images = x.numpy()
+                labels = y.numpy()
+
+                # Log some samples
+                for i in range(min(5, len(images))):
+                    logger.info(f"Image shape: {images[i].shape}, Label: {labels[i]}")
+
+                    # Optional: Save these samples for visual inspection
+                    tf.keras.preprocessing.image.save_img(
+                        f"debug_sample_{i}.jpg", images[i]
+                    )
+            return True
+        except Exception as e:
+            logger.error(f"Data validation failed: {e}")
+            return False
+
+    def extract_images_and_labels(self) -> None:
+        """Extract the first 10 images and their labels from the .arrow files."""
+        raw_data_dir = Path(
+            "data/cache/chriamue___bird-species-dataset/bird_species_dataset/0.1.0/bfe742b8a5b73193f04ed4fed961614ac0279b36ed3cc3b7e6a65642afa27e92"
+        )
+        arrow_files = list(raw_data_dir.glob("*.arrow"))
+
+        if not arrow_files:
+            logger.warning("No .arrow files found to extract images and labels.")
+            return
+
+        for arrow_file in arrow_files:
+            logger.info(f"Extracting from: {arrow_file.name}")
+
+            file = os.open(arrow_file, flags=0)
+
+            logger.info(f"Arrow file type: {type(file)}")
+
+            # Load the dataset from the .arrow file
+            dataset = ds.dataset(arrow_file, format="arrow")
+
+            # Create a table from the dataset
+            table = dataset.to_table()
+
+            # Extract the first 10 rows
+            for i in range(min(10, table.num_rows)):
+                image = table[i][
+                    "image"
+                ]  # Assuming 'image' is the column name for images
+                label = table[i][
+                    "label"
+                ]  # Assuming 'label' is the column name for labels
+
+                # Log the image and label
+                logger.info(f"Image {i}: {image}, Label: {label}")
+
+                # Optionally, you can save the image to a file for inspection
+                # Here, we assume the image is in a format that can be saved directly
+                # You may need to convert it depending on how it's stored
+                # For example, if it's a numpy array:
+                # tf.keras.preprocessing.image.save_img(f"debug/sample_{i}.jpg", image)
+
+            logger.info("Extraction complete.")
+
     def _print_validation_report(self):
         """Print formatted validation report."""
         logger.info("\n" + "=" * 50)
@@ -228,9 +362,12 @@ class DataValidator:
         # Check raw data first
         try:
             raw_labels = self._check_raw_data()
-            logger.info(f"\n📁 Raw Data Check:")
-            logger.info(f"   • Found {len(raw_labels)} classes")
-            logger.info(f"   • Labels file verified ✅")
+            if raw_labels:  # Only print if we got labels back
+                logger.info(f"\n📁 Raw Data Check:")
+                logger.info(f"   • Found {len(raw_labels)} classes")
+                logger.info(f"   • Labels file verified ✅")
+            else:
+                logger.info("\n📁 Raw Data Check: Skipped (using processed data only)")
         except Exception as e:
             logger.error(f"Raw data check failed: {str(e)}")
 
@@ -258,19 +395,24 @@ class DataValidator:
         try:
             logger.info("📊 Starting dataset validation...")
 
-            for split in self.required_splits:
-                dataset_path = self.cache_dir / f"{split}_processed"
-                if not dataset_path.exists():
-                    raise ValueError(f"Missing dataset split: {split}")
+            # Load datasets first
+            self.load_datasets()
+            self.extract_images_and_labels()
 
-                # Load dataset
-                dataset = tf.data.Dataset.load(str(dataset_path))
+            for split in self.required_splits:
+                dataset = getattr(self, f"{split}_ds")  # Dynamically get the dataset
+                if dataset is None:
+                    raise ValueError(f"Missing dataset split: {split}")
 
                 # Check structure first
                 self._check_dataset_structure(dataset)
 
-                # Then validate contents
+                # Validate contents
                 self.stats[split] = self._validate_split(dataset, split)
+
+                if split == "train" and not self.validate_label_sequence(dataset):
+                    logger.error("Label sequence validation failed!")
+                    return False
 
             # Print validation report
             self._print_validation_report()

@@ -9,7 +9,7 @@ from tqdm import tqdm
 import tensorflow as tf
 import logging
 from .config import Config
-from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -18,6 +18,23 @@ logging.basicConfig(
     handlers=[logging.FileHandler("preprocessing.log"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+def create_dataset_in_chunks(data, labels, chunk_size=1000):
+    """Create dataset in chunks to avoid memory issues"""
+    datasets = []
+    for i in range(0, len(data), chunk_size):
+        chunk_data = data[i : i + chunk_size]
+        chunk_labels = labels[i : i + chunk_size]
+        with tf.device("/CPU:0"):
+            dataset = tf.data.Dataset.from_tensor_slices(
+                (
+                    tf.convert_to_tensor(chunk_data, dtype=tf.float32),
+                    tf.convert_to_tensor(chunk_labels, dtype=tf.int64),
+                )
+            )
+        datasets.append(dataset)
+    return datasets[0] if len(datasets) == 1 else datasets[0].concatenate(*datasets[1:])
 
 
 def main():
@@ -56,7 +73,11 @@ def main():
                 batch_labels = [item["label"] for item in batch_data]
 
                 # Process images in parallel
-                processed_batch = converter.process_batch(batch_images)
+                try:
+                    processed_batch = converter.process_batch(batch_images)
+                except Exception as e:
+                    logger.error(f"Error processing batch {i} for {split}: {str(e)}")
+                    continue  # Skip this batch and continue with the next
 
                 # Extend our lists with the processed data
                 processed_images.extend(processed_batch)
@@ -64,23 +85,69 @@ def main():
 
                 pbar.update(len(batch_indices))
 
-        # Convert to TensorFlow dataset
+        # Shuffle the processed data
+        logger.info(f"Shuffling {split} dataset...")
+        idx = np.random.RandomState(42).permutation(len(processed_images))
+        processed_images = np.array(processed_images)[idx]
+        processed_labels = np.array(processed_labels)[idx]
+
+        # Convert to TensorFlow dataset using chunks
         logger.info(f"Creating TensorFlow dataset for {split}")
-        images_tensor = tf.convert_to_tensor(processed_images, dtype=tf.float32)
-        labels_tensor = tf.convert_to_tensor(processed_labels, dtype=tf.int64)
+        try:
+            # Process tensors in chunks on CPU
+            logger.info("Converting images to tensor (in chunks)...")
+            images_tensor = create_dataset_in_chunks(processed_images, processed_labels)
 
-        # Create and save dataset
-        tf_dataset = tf.data.Dataset.from_tensor_slices((images_tensor, labels_tensor))
-        save_path = cache_dir / f"{split}_processed"
-        tf.data.Dataset.save(tf_dataset, str(save_path))
+            logger.info("Converting labels to tensor (in chunks)...")
+            labels_tensor = create_dataset_in_chunks(processed_labels, processed_labels)
 
-        logger.info(f"Dataset shapes for {split}:")
-        logger.info(f"Images shape: {images_tensor.shape}")
-        logger.info(f"Labels shape: {labels_tensor.shape}")
+            # Create and save dataset
+            tf_dataset = tf.data.Dataset.from_tensor_slices(
+                (images_tensor, labels_tensor)
+            )
+            save_path = cache_dir / f"{split}_processed"
 
-        processed_datasets[split] = tf_dataset
+            logger.info(f"Saving dataset to {save_path}")
+            tf.data.Dataset.save(tf_dataset, str(save_path))
+
+            logger.info(f"Dataset shapes for {split}:")
+            logger.info(f"Images shape: {images_tensor.shape}")
+            logger.info(f"Labels shape: {labels_tensor.shape}")
+
+            processed_datasets[split] = tf_dataset
+
+        except Exception as e:
+            logger.error(f"Error creating dataset for {split}: {str(e)}")
+            raise
 
     return processed_datasets
+
+
+def process_data(data_dir: Path):
+    """Process and shuffle data properly"""
+    logger.info("Starting data reprocessing with proper shuffling...")
+
+    # Load all image paths and labels
+    image_paths = []
+    labels = []
+    for class_idx, class_dir in enumerate(sorted(data_dir.glob("*/"))):
+        for img_path in class_dir.glob("*.jpg"):
+            image_paths.append(img_path)
+            labels.append(class_idx)
+
+    # Convert to numpy arrays
+    image_paths = np.array(image_paths)
+    labels = np.array(labels)
+
+    # Shuffle with fixed seed
+    idx = np.random.RandomState(42).permutation(len(image_paths))
+    image_paths = image_paths[idx]
+    labels = labels[idx]
+
+    logger.info(f"Total images: {len(image_paths)}")
+    logger.info(f"Unique labels: {len(np.unique(labels))}")
+
+    return image_paths, labels
 
 
 if __name__ == "__main__":

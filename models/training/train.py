@@ -20,66 +20,112 @@ try:
     # Enable Metal GPU acceleration
     physical_devices = tf.config.list_physical_devices("GPU")
     if len(physical_devices) > 0:
+        # Allow memory growth
         tf.config.experimental.set_memory_growth(physical_devices[0], True)
-        tf.config.experimental.set_virtual_device_configuration(
+        # Set memory limit (in MB)
+        tf.config.set_logical_device_configuration(
             physical_devices[0],
-            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=4096)],
         )
         logger.info(f"Metal GPU enabled: {physical_devices}")
+
+        # Enable mixed precision for better performance
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        logger.info("Mixed precision enabled")
     else:
         logger.warning("No Metal GPU found")
 except Exception as e:
-    logger.warning(f"Error configuring Metal GPU: {e}")
+    logger.error(f"Error configuring Metal GPU: {e}")
 
 
 class ModelTrainer:
     def __init__(self):
-        # validate dataset
+        # Validate dataset
         validator = DataValidator()
         if not validator.validate_all():
             raise ValueError("Dataset validation failed. Exiting.")
 
         self.model = None
-        self.model = None
-        self.train_ds = None
-        self.val_ds = None
-        self.test_ds = None
+        self.train_ds = validator.train_ds
+        self.val_ds = validator.val_ds
+        self.test_ds = validator.test_ds
         self.history = None
         self.checkpoint_dir = Path(Config.CHECKPOINT_PATH)
         self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        self.class_counts = None
 
-        # Optimize dataset performance
-        self.strategy = tf.distribute.MirroredStrategy()
-        logger.info(f"Number of devices: {self.strategy.num_replicas_in_sync}")
+        # Use appropriate strategy for Metal GPU
+        if len(tf.config.list_physical_devices("GPU")) > 0:
+            self.strategy = tf.distribute.OneDeviceStrategy("/GPU:0")
+            logger.info("Using GPU strategy")
+        else:
+            self.strategy = tf.distribute.get_strategy()
+            logger.warning("Using default (CPU) strategy")
+
+    def monitor_gpu(self):
+        """Monitor GPU memory usage"""
+        try:
+            gpu_devices = tf.config.list_physical_devices("GPU")
+            if gpu_devices:
+                memory_info = tf.config.experimental.get_memory_info("GPU:0")
+                logger.info(
+                    f"GPU Memory: {memory_info['current'] / 1024**2:.2f}MB used"
+                )
+        except Exception as e:
+            logger.warning(f"Could not get GPU memory info: {e}")
 
     def load_datasets(self):
-        """Load cached preprocessed datasets with fixed dimensions"""
+        """Load datasets and compute class distribution"""
         logger.info("Loading cached preprocessed datasets...")
         try:
             cache_dir = Path("data/cache")
 
-            def load_and_prepare(split_name):
+            def load_and_prepare(split_name, shuffle=True):
                 ds = tf.data.Dataset.load(str(cache_dir / f"{split_name}_processed"))
-                return (
-                    ds.map(
-                        # Ensure correct dimensions
-                        lambda x, y: (
-                            tf.ensure_shape(
-                                tf.cast(x, tf.float32) / 255.0,
-                                [96, 96, 3],  # Force correct shape
-                            ),
-                            y,
-                        ),
-                        num_parallel_calls=tf.data.AUTOTUNE,
+
+                if shuffle:
+                    ds = ds.shuffle(
+                        buffer_size=Config.SHUFFLE_BUFFER,
+                        seed=42,
+                        reshuffle_each_iteration=True,
                     )
-                    .batch(Config.BATCH_SIZE, drop_remainder=True)
-                    .prefetch(tf.data.AUTOTUNE)
+
+                return ds.map(
+                    lambda x, y: (
+                        tf.ensure_shape(tf.cast(x, tf.float32) / 255.0, [96, 96, 3]),
+                        y,
+                    ),
+                    num_parallel_calls=tf.data.AUTOTUNE,
                 )
 
             # Load datasets
-            self.train_ds = load_and_prepare("train")
-            self.val_ds = load_and_prepare("validation")
-            self.test_ds = load_and_prepare("test")
+            train_raw = load_and_prepare(
+                "train", shuffle=False
+            )  # No shuffle for counting
+            self.train_ds = train_raw.batch(Config.BATCH_SIZE).prefetch(
+                tf.data.AUTOTUNE
+            )
+            self.val_ds = (
+                load_and_prepare("validation", shuffle=False)
+                .batch(Config.BATCH_SIZE)
+                .prefetch(tf.data.AUTOTUNE)
+            )
+            self.test_ds = (
+                load_and_prepare("test", shuffle=False)
+                .batch(Config.BATCH_SIZE)
+                .prefetch(tf.data.AUTOTUNE)
+            )
+
+            # Count class distribution
+            logger.info("Calculating class distribution...")
+            self.class_counts = {}
+            for _, labels in train_raw:  # Use unbatched dataset
+                label = int(labels.numpy())
+                self.class_counts[label] = self.class_counts.get(label, 0) + 1
+
+            logger.info(f"Found {len(self.class_counts)} classes")
+            logger.info(f"Min samples per class: {min(self.class_counts.values())}")
+            logger.info(f"Max samples per class: {max(self.class_counts.values())}")
 
             # Verify shapes
             for x, y in self.train_ds.take(1):
@@ -88,94 +134,168 @@ class ModelTrainer:
             return True
 
         except Exception as e:
+            logger.error(f"Failed to load datasets: {str(e)}")
+            return False
+        except Exception as e:
             logger.error(f"Failed to load cached datasets: {str(e)}")
             return False
 
     def setup_model(self):
-        """Initialize EfficientNet-B2 with M1 optimizations"""
+        """Initialize EfficientNet-B2 model with GPU optimizations"""
         logger.info("Setting up EfficientNet-B2 model...")
 
         try:
-            # Set mixed precision policy before model creation
-            tf.keras.mixed_precision.set_global_policy(
-                "float32"
-            )  # Changed from mixed_float16
+            with self.strategy.scope():
+                base_model = tf.keras.applications.EfficientNetB2(
+                    include_top=False,
+                    weights="imagenet",
+                    input_shape=(Config.IMG_SIZE, Config.IMG_SIZE, 3),
+                )
 
-            # Create model without distribution strategy for simplicity
-            # Remove the strategy scope since we're running on single device
+                # Partial unfreezing
+                base_model.trainable = True
+                for layer in base_model.layers[:-30]:
+                    layer.trainable = False
 
-            # 1. Create base model
-            base_model = tf.keras.applications.EfficientNetB2(
-                include_top=False,
-                weights="imagenet",
-                input_shape=(Config.IMG_SIZE, Config.IMG_SIZE, 3),
-            )
+                # Build model with GPU-optimized layers
+                inputs = tf.keras.Input(shape=(Config.IMG_SIZE, Config.IMG_SIZE, 3))
+                x = base_model(inputs)
+                x = tf.keras.layers.GlobalAveragePooling2D()(x)
+                x = tf.keras.layers.BatchNormalization()(x)
+                x = tf.keras.layers.Dropout(0.6)(x)
+                x = tf.keras.layers.Dense(1024, activation="relu")(x)
+                x = tf.keras.layers.Dropout(0.6)(x)
+                outputs = tf.keras.layers.Dense(
+                    Config.NUM_CLASSES,
+                    activation="softmax",
+                    dtype="float32",  # Ensure final output is float32 for mixed precision
+                )(x)
 
-            # 2. Freeze base model
-            base_model.trainable = False
+                self.model = tf.keras.Model(inputs, outputs)
 
-            # 3. Create full model architecture
-            inputs = tf.keras.Input(shape=(Config.IMG_SIZE, Config.IMG_SIZE, 3))
-            x = base_model(inputs)
-            x = tf.keras.layers.GlobalAveragePooling2D()(x)
-            x = tf.keras.layers.BatchNormalization()(x)
-            x = tf.keras.layers.Dropout(0.3)(x)
-            x = tf.keras.layers.Dense(512, activation="relu")(x)
-            x = tf.keras.layers.Dropout(0.5)(x)
-            outputs = tf.keras.layers.Dense(Config.NUM_CLASSES, activation="softmax")(x)
+                # Compile with GPU-optimized settings
+                self.model.compile(
+                    optimizer=tf.keras.optimizers.Adam(Config.LEARNING_RATE),
+                    loss="sparse_categorical_crossentropy",
+                    metrics=["accuracy"],
+                    jit_compile=True,  # Enable XLA optimization
+                )
 
-            # 4. Create the full model
-            self.model = tf.keras.Model(inputs, outputs)
-
-            # 5. Compile model
-            self.model.compile(
-                optimizer=tf.keras.optimizers.Adam(Config.LEARNING_RATE),
-                loss="sparse_categorical_crossentropy",
-                metrics=["accuracy"],
-            )
-
-            # 6. Print model summary
-            self.model.summary(print_fn=logger.info)
-            logger.info("Model setup complete")
-            return True
+                self.model.summary(print_fn=logger.info)
+                return True
 
         except Exception as e:
             logger.error(f"Failed to setup model: {str(e)}")
             return False
 
     def train(self):
-        """Execute training loop with M1 optimizations"""
-        callbacks = [
-            tf.keras.callbacks.ModelCheckpoint(
-                filepath=str(self.checkpoint_dir / "best_model.keras"),
-                save_best_only=True,
-                monitor="val_accuracy",
-            ),
-            tf.keras.callbacks.EarlyStopping(
-                monitor="val_accuracy", patience=3, restore_best_weights=True
-            ),
-            tf.keras.callbacks.TensorBoard(
-                log_dir=f"logs/{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-                profile_batch="100,120",  # Enable profiling
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor="val_loss", factor=0.2, patience=2
-            ),
-        ]
-
+        """Execute training with GPU monitoring"""
         try:
+            # Setup callbacks with GPU monitoring
+            callbacks = [
+                # Save best model
+                tf.keras.callbacks.ModelCheckpoint(
+                    filepath=str(self.checkpoint_dir / "best_model.keras"),
+                    save_best_only=True,
+                    monitor="val_accuracy",
+                ),
+                # Stop if not improving
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_accuracy", patience=3, restore_best_weights=True
+                ),
+                # Monitor training with GPU info
+                tf.keras.callbacks.LambdaCallback(
+                    on_epoch_end=lambda epoch, logs: self.monitor_gpu()
+                ),
+                # Reduce learning rate when stuck
+                tf.keras.callbacks.ReduceLROnPlateau(
+                    monitor="val_loss", factor=0.2, patience=2, min_lr=1e-6
+                ),
+                # Save training history
+                tf.keras.callbacks.CSVLogger(
+                    "training_history.csv", separator=",", append=False
+                ),
+            ]
+
+            # Calculate class weights
+            total_samples = sum(self.class_counts.values())
+            class_weights = {
+                cls: total_samples / (len(self.class_counts) * count)
+                for cls, count in self.class_counts.items()
+            }
+
+            logger.info("Starting training with GPU acceleration...")
+            self.monitor_gpu()  # Initial GPU memory check
+
+            # Train with weights and callbacks
             self.history = self.model.fit(
                 self.train_ds,
                 validation_data=self.val_ds,
                 epochs=Config.EPOCHS,
+                class_weight=class_weights,
                 callbacks=callbacks,
+                verbose=1,
             )
 
+            # Final GPU memory check
+            self.monitor_gpu()
+
+            # Save and plot
+            self._plot_training_history()
             self.model.save("models/converted/final_model.keras")
             return True
+
         except Exception as e:
             logger.error(f"Training failed: {str(e)}")
             return False
+
+    def _plot_training_history(self):
+        """Plot training metrics"""
+        import matplotlib.pyplot as plt
+
+        # Plot accuracy
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 2, 1)
+        plt.plot(self.history.history["accuracy"])
+        plt.plot(self.history.history["val_accuracy"])
+        plt.title("Model Accuracy")
+        plt.ylabel("Accuracy")
+        plt.xlabel("Epoch")
+        plt.legend(["Train", "Validation"])
+
+        # Plot loss
+        plt.subplot(1, 2, 2)
+        plt.plot(self.history.history["loss"])
+        plt.plot(self.history.history["val_loss"])
+        plt.title("Model Loss")
+        plt.ylabel("Loss")
+        plt.xlabel("Epoch")
+        plt.legend(["Train", "Validation"])
+
+        plt.tight_layout()
+        plt.savefig("training_history.png")
+        plt.close()
+
+    def verify_data_pipeline(self):
+        """Verify data pipeline integrity"""
+        logger.info("Verifying data pipeline...")
+
+        # Check a batch
+        for images, labels in self.train_ds.take(1):
+            logger.info(f"Batch shape: {images.shape}")
+            logger.info(f"Labels shape: {labels.shape}")
+            logger.info(
+                f"Label range: {tf.reduce_min(labels)} to {tf.reduce_max(labels)}"
+            )
+            logger.info(
+                f"Image value range: {tf.reduce_min(images)} to {tf.reduce_max(images)}"
+            )
+
+            # Save some sample images with their labels
+            for i in range(min(5, len(images))):
+                img = images[i].numpy()
+                label = labels[i].numpy()
+                tf.keras.utils.save_img(f"debug/sample_{i}_label_{label}.jpg", img)
 
 
 def main():
