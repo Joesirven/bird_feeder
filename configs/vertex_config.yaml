@@ -1,0 +1,19 @@
+project:
+  id: "smart-bird-feeder"
+  region: "us-central1"
+  bucket: "bird-species-dataset"
+
+model:
+  name: "bird_classifier"
+  framework: "tensorflow"
+  input_shape: [96, 96, 3]
+  base_model: "mobilenetv2"
+  alpha: 0.35
+  num_classes: 16
+  batch_size: 32
+  epochs: 15
+
+training:
+  machine_type: "n1-standard-8"
+  accelerator: "NVIDIA_TESLA_T4"
+  accelerator_count: 1
